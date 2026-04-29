@@ -255,9 +255,18 @@ MIT License — free forever.
             """)
 
 if __name__ == "__main__":
+    import socket
+    local_ip = socket.gethostbyname(socket.gethostname())
+    print("\n" + "="*60)
+    print("  🎬  Agent Opus is starting…")
+    print("="*60)
+    print(f"  Local:   http://localhost:7860")
+    print(f"  Network: http://{local_ip}:7860")
+    print("  Public:  generating share link… (check below)")
+    print("="*60 + "\n")
     demo.launch(
         server_port=7860,
-        share=False,
+        share=True,           # ← public *.gradio.live URL for anyone on the internet
         inbrowser=True,
         show_error=True,
         theme=gr.themes.Soft(primary_hue="red", secondary_hue="orange"),
