@@ -18,6 +18,21 @@ footer { display: none !important; }
 #hero p  { font-size: 1.1em; opacity: 0.8; }
 """
 
+# ── Clipper cache — one instance per Whisper model size ──────────────────────
+# Avoids reloading Whisper + YOLO on every single run (huge speed win).
+_clipper_cache: dict = {}
+
+def _get_clipper(whisper_size: str, callback) -> AgentOpusClipper:
+    if whisper_size not in _clipper_cache:
+        _clipper_cache[whisper_size] = AgentOpusClipper(
+            whisper_model_size=whisper_size,
+            progress_callback=callback,
+        )
+    inst = _clipper_cache[whisper_size]
+    inst._cb = callback  # update callback for this run
+    return inst
+
+
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 def run_pipeline(url, uploaded_file, max_clips, aspect_ratio,
                  whisper_size, ollama_model, progress=gr.Progress()):
@@ -29,10 +44,7 @@ def run_pipeline(url, uploaded_file, max_clips, aspect_ratio,
         print(f"[{pct:3d}%] {msg}")
 
     try:
-        clipper = AgentOpusClipper(
-            whisper_model_size=whisper_size,
-            progress_callback=update,
-        )
+        clipper = _get_clipper(whisper_size, update)
 
         # Resolve source
         if url and url.strip():
@@ -42,18 +54,22 @@ def run_pipeline(url, uploaded_file, max_clips, aspect_ratio,
         else:
             return "❌ Please provide a YouTube URL or upload a video.", [], None, ""
 
+        # "none" model → skip Ollama, use heuristic scorer
+        llm = ollama_model if ollama_model != "none" else "none"
+
         results = clipper.run(
             source, is_url=is_url,
             max_clips=int(max_clips),
             aspect=aspect_ratio,
-            ollama_model=ollama_model,
+            ollama_model=llm,
         )
 
         # ZIP all clips
         zip_path = os.path.join(OUTPUT_DIR, "agent_opus_clips.zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for r in results:
-                zf.write(r["path"], os.path.basename(r["path"]))
+                if os.path.exists(r["path"]):
+                    zf.write(r["path"], os.path.basename(r["path"]))
 
         # Summary report
         lines = [f"✅ Generated {len(results)} viral clips!\n",
@@ -67,7 +83,7 @@ def run_pipeline(url, uploaded_file, max_clips, aspect_ratio,
             )
 
         summary  = "\n".join(lines)
-        thumbs   = [r["thumb"] for r in results if os.path.exists(r.get("thumb",""))]
+        thumbs   = [r["thumb"] for r in results if os.path.exists(r.get("thumb", ""))]
         log_text = "\n".join(logs)
         return summary, thumbs, zip_path, log_text
 
@@ -106,7 +122,8 @@ with gr.Blocks(title="Agent Opus — Free Opus Clip Alternative") as demo:
                     gr.Markdown("**— or —**")
                     upload_file = gr.File(
                         label="Upload Local Video",
-                        file_types=["video"],
+                        file_types=[".mp4", ".mov", ".avi", ".mkv",
+                                    ".webm", ".m4v", ".ts"],
                     )
 
                     gr.Markdown("### ⚙️ Options")
@@ -155,17 +172,19 @@ with gr.Blocks(title="Agent Opus — Free Opus Clip Alternative") as demo:
                     download_zip = gr.File(
                         label="⬇️ Download All Clips (ZIP)",
                     )
-                    log_box = gr.Textbox(
+                    log_visible  = gr.State(False)
+                    log_box      = gr.Textbox(
                         label="Processing Log",
                         lines=6,
                         interactive=False,
                         visible=False,
                     )
                     show_log_btn = gr.Button("Show/Hide Log", size="sm")
+                    # Fix: use gr.State to track visibility, not the textbox value
                     show_log_btn.click(
-                        fn=lambda v: gr.update(visible=not v),
-                        inputs=[log_box],
-                        outputs=[log_box],
+                        fn=lambda v: (gr.update(visible=not v), not v),
+                        inputs=[log_visible],
+                        outputs=[log_box, log_visible],
                     )
 
             run_btn.click(
@@ -195,22 +214,23 @@ with gr.Blocks(title="Agent Opus — Free Opus Clip Alternative") as demo:
 | **Batch / CLI** | **✅ python clipper.py --url …** | Limited |
 | **Offline** | **✅ 100%** | ❌ |
 | **Max video length** | **Unlimited** | Limited on free tier |
+| **No playlist download** | **✅ Single video only** | N/A |
 
 ## How It Works
 
-1. **Download** — yt-dlp fetches any public video at up to 1080p  
-2. **Transcribe** — Faster-Whisper runs entirely on your GPU (word-level timestamps)  
-3. **Analyse** — Llama 3 (local Ollama) scores viral potential + fallback heuristic  
-4. **Track** — YOLOv8 detects the speaker; scipy smooths the pan  
-5. **Captions** — Per-word animated yellow highlights, burned into the video  
-6. **Render** — MoviePy + FFmpeg encodes 9:16 clips at CRF 18 (broadcast quality)
+1. **Download** — yt-dlp fetches any public video at up to 1080p (single video only)
+2. **Transcribe** — Faster-Whisper runs entirely on your GPU (word-level timestamps)
+3. **Analyse** — Llama 3 (local Ollama) scores viral potential + fallback heuristic
+4. **Track** — YOLOv8 detects the speaker; scipy smooths the pan
+5. **Captions** — Per-word animated yellow highlights, burned into the video
+6. **Render** — MoviePy + FFmpeg encodes clips at CRF 18 (broadcast quality)
 
 ## System Requirements
 
-- Windows 10/11, Linux, or macOS  
-- Python 3.10+  
-- NVIDIA GPU with 8 GB+ VRAM (CPU fallback available, slower)  
-- [Ollama](https://ollama.com) + `ollama pull llama3` *(optional but recommended)*  
+- Windows 10/11, Linux, or macOS
+- Python 3.10+
+- NVIDIA GPU with 8 GB+ VRAM (CPU fallback available, slower)
+- [Ollama](https://ollama.com) + `ollama pull llama3` *(optional but recommended)*
 - FFmpeg (bundled on Windows)
             """)
 
@@ -221,7 +241,7 @@ with gr.Blocks(title="Agent Opus — Free Opus Clip Alternative") as demo:
 
 ```bash
 # 1. Clone
-git clone https://github.com/agentopus/agent-opus.git
+git clone https://github.com/atherion005-byte/agent-opus.git
 cd agent-opus
 
 # 2. Install
@@ -243,30 +263,33 @@ python clipping_tool/clipper.py --url "https://youtu.be/XXXXXXXXXXX" --clips 6
 # From a local file
 python clipping_tool/clipper.py --file my_podcast.mp4 --aspect 9:16
 
-# Square format
-python clipping_tool/clipper.py --file interview.mp4 --aspect 1:1 --clips 8
+# Square format, heuristic scorer only (no Ollama needed)
+python clipping_tool/clipper.py --file interview.mp4 --aspect 1:1 --clips 8 --llm none
 ```
 
 ## GitHub
 
-⭐ Star us: **https://github.com/agentopus/agent-opus**
+⭐ Star us: **https://github.com/atherion005-byte/agent-opus**
 
 MIT License — free forever.
             """)
 
 if __name__ == "__main__":
     import socket
-    local_ip = socket.gethostbyname(socket.gethostname())
-    print("\n" + "="*60)
+    try:
+        local_ip = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        local_ip = "localhost"
+    print("\n" + "=" * 60)
     print("  🎬  Agent Opus is starting…")
-    print("="*60)
+    print("=" * 60)
     print(f"  Local:   http://localhost:7860")
     print(f"  Network: http://{local_ip}:7860")
     print("  Public:  generating share link… (check below)")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
     demo.launch(
         server_port=7860,
-        share=True,           # ← public *.gradio.live URL for anyone on the internet
+        share=True,           # public *.gradio.live URL for anyone on the internet
         inbrowser=True,
         show_error=True,
         theme=gr.themes.Soft(primary_hue="red", secondary_hue="orange"),

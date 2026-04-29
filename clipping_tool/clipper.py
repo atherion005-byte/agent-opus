@@ -12,18 +12,22 @@ import numpy as np
 from faster_whisper import WhisperModel
 import yt_dlp
 from moviepy import VideoFileClip, ImageClip, CompositeVideoClip
-from scipy import interpolate
 from scipy.ndimage import uniform_filter1d
 from PIL import Image, ImageDraw, ImageFont
 from ultralytics import YOLO
-import ollama
+
+# ── Optional Ollama (graceful if not installed) ───────────────────────────────
+try:
+    import ollama as _ollama
+    _OLLAMA_AVAILABLE = True
+except ImportError:
+    _OLLAMA_AVAILABLE = False
 
 # ─── FFmpeg ───────────────────────────────────────────────────────────────────
 FFMPEG_DIR  = r"D:\AI\AgentOpus\ffmpeg\ffmpeg-8.1-essentials_build\bin"
 FFMPEG_BIN  = os.path.join(FFMPEG_DIR, "ffmpeg.exe")
 FFPROBE_BIN = os.path.join(FFMPEG_DIR, "ffprobe.exe")
 
-# Inject into PATH so yt-dlp, moviepy, and subprocess all find ffmpeg
 if FFMPEG_DIR not in os.environ.get("PATH", ""):
     os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ.get("PATH", "")
 os.environ.setdefault("FFMPEG_BINARY",  FFMPEG_BIN)
@@ -100,10 +104,11 @@ class AgentOpusClipper:
             "format": ("bestvideo[height<=1080][ext=mp4]"
                        "+bestaudio[ext=m4a]"
                        "/best[height<=1080][ext=mp4]/best"),
-            "outtmpl": out_path,
-            "ffmpeg_location": FFMPEG_DIR,
+            "outtmpl":             out_path,
+            "ffmpeg_location":     FFMPEG_DIR,
             "merge_output_format": "mp4",
-            "quiet": True,
+            "noplaylist":          True,   # never download a whole playlist
+            "quiet":               True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -160,12 +165,12 @@ class AgentOpusClipper:
         pw_hits = sum(1 for pw in _POWER_WORDS if pw in text)
         score  += min(pw_hits * 4, 20)
 
-        if "?" in text:              score += 8
-        if "!" in text:              score += 5
-        if re.search(r"\b\d+\b", text): score += 4
+        if "?" in text:                  score += 8
+        if "!" in text:                  score += 5
+        if re.search(r"\b\d+\b", text):  score += 4
 
         conf = np.mean([w.get("probability", 0.85) for w in words_in])
-        if conf > 0.90: score += 5
+        if conf > 0.90:  score += 5
 
         return min(int(score), 99)
 
@@ -175,49 +180,55 @@ class AgentOpusClipper:
                            ollama_model="llama3"):
         self._cb("AI analysing viral potential…", 40)
 
-        # ─ Try Ollama (optional — works without it) ─
-        try:
-            ts_text = " ".join(
-                f"[{s['start']:.1f}s-{s['end']:.1f}s] {s['text']}"
-                for s in segments[:80]
-            )
-            prompt = (
-                f"You are a viral content expert. Find the {max_clips} best segments "
-                f"for YouTube Shorts/TikTok.\n"
-                f"Rules: {min_dur}–{max_dur} seconds each, strong hook, complete thought.\n"
-                f"Return ONLY valid JSON array. Each object: "
-                f'"start"(float),"end"(float),"title"(≤6 words),'
-                f'"reason"(why viral),"hook"(opening line).\n\n'
-                f"Transcript:\n{ts_text[:6000]}"
-            )
-            resp = ollama.chat(
-                model=ollama_model,
-                messages=[{"role": "user", "content": prompt}],
-                options={"temperature": 0.3},
-            )
-            raw   = resp["message"]["content"]
-            s_idx = raw.find("["); e_idx = raw.rfind("]") + 1
-            if s_idx >= 0 and e_idx > s_idx:
-                candidates = json.loads(raw[s_idx:e_idx])
-                valid = []
-                for h in candidates:
-                    s = float(h.get("start", 0))
-                    e = float(h.get("end",   0))
-                    if min_dur <= (e - s) <= max_dur:
-                        h["virality_score"] = self._virality_score(segments, s, e)
-                        h.setdefault("title", f"Clip {len(valid)+1}")
-                        valid.append(h)
-                if valid:
-                    return sorted(valid, key=lambda x: x["virality_score"], reverse=True)
-        except Exception as ex:
-            print(f"[Ollama] {ex} — heuristic scorer activated.")
+        # ─ Try Ollama (skipped if not installed or model == "none") ─
+        use_ollama = _OLLAMA_AVAILABLE and ollama_model.lower() != "none"
+        if use_ollama:
+            try:
+                ts_text = " ".join(
+                    f"[{s['start']:.1f}s-{s['end']:.1f}s] {s['text']}"
+                    for s in segments[:80]
+                )
+                prompt = (
+                    f"You are a viral content expert. Find the {max_clips} best segments "
+                    f"for YouTube Shorts/TikTok.\n"
+                    f"Rules: {min_dur}–{max_dur} seconds each, strong hook, complete thought.\n"
+                    f"Return ONLY valid JSON array. Each object: "
+                    f'"start"(float),"end"(float),"title"(≤6 words),'
+                    f'"reason"(why viral),"hook"(opening line).\n\n'
+                    f"Transcript:\n{ts_text[:6000]}"
+                )
+                resp = _ollama.chat(
+                    model=ollama_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    options={"temperature": 0.3},
+                )
+                # ollama 0.2+ returns an object; 0.1.x returned a dict — handle both
+                try:
+                    raw = resp.message.content
+                except AttributeError:
+                    raw = resp["message"]["content"]
+
+                s_idx = raw.find("["); e_idx = raw.rfind("]") + 1
+                if s_idx >= 0 and e_idx > s_idx:
+                    candidates = json.loads(raw[s_idx:e_idx])
+                    valid = []
+                    for h in candidates:
+                        s = float(h.get("start", 0))
+                        e = float(h.get("end",   0))
+                        if min_dur <= (e - s) <= max_dur:
+                            h["virality_score"] = self._virality_score(segments, s, e)
+                            h.setdefault("title", f"Clip {len(valid)+1}")
+                            valid.append(h)
+                    if valid:
+                        return sorted(valid, key=lambda x: x["virality_score"], reverse=True)
+            except Exception as ex:
+                print(f"[Ollama] {ex} — heuristic scorer activated.")
 
         # ─ Heuristic fallback (no LLM needed) ─
         if not segments:
             return []
 
         total_dur = segments[-1]["end"]
-        # Adapt window to video length
         window = min(max_dur, max(min_dur, total_dur * 0.4))
         step   = max(5.0, window * 0.2)
         scored = []
@@ -229,7 +240,8 @@ class AgentOpusClipper:
         scored.sort(key=lambda x: x[2], reverse=True)
         selected, highlights = [], []
         for s, e, score in scored:
-            if not any(not (e <= sel[0] or s >= sel[1]) for sel in selected):
+            # No overlap with already-selected segments
+            if all(e <= sel[0] or s >= sel[1] for sel in selected):
                 selected.append((s, e))
                 idx = len(selected)
                 highlights.append({
@@ -246,7 +258,7 @@ class AgentOpusClipper:
 
     # ── Face tracking ─────────────────────────────────────────────────────────
     def _compute_face_track(self, video, sample_fps=5):
-        """Returns a scipy interpolator t→center_x, or None if no faces found."""
+        """Returns a closure t→center_x (float), or None if no faces found."""
         dur = video.duration
         times_raw, centers_raw = [], []
 
@@ -263,12 +275,15 @@ class AgentOpusClipper:
         if len(centers_raw) < 2:
             return None
 
-        smoothed = uniform_filter1d(centers_raw, size=max(1, sample_fps * 2))
-        return interpolate.interp1d(
-            times_raw, smoothed, kind="linear",
-            bounds_error=False,
-            fill_value=(smoothed[0], smoothed[-1]),
-        )
+        t_arr    = np.array(times_raw,   dtype=float)
+        c_arr    = np.array(centers_raw, dtype=float)
+        smoothed = uniform_filter1d(c_arr, size=max(1, sample_fps * 2))
+
+        # np.interp replaces the deprecated scipy.interpolate.interp1d
+        def _interp(t: float) -> float:
+            return float(np.interp(t, t_arr, smoothed))
+
+        return _interp
 
     # ── Caption rendering ─────────────────────────────────────────────────────
     def _render_caption_image(self, phrase_words, current_idx,
@@ -280,42 +295,55 @@ class AgentOpusClipper:
         draw = ImageDraw.Draw(img)
         fnt  = self._make_font(font_size)
 
-        full_text = " ".join(w["word"] for w in phrase_words)
+        # Build token list — trailing space on every word except the last
+        tokens = [
+            w["word"] + (" " if i < len(phrase_words) - 1 else "")
+            for i, w in enumerate(phrase_words)
+        ]
+
+        # Centre-align based on the joined full string
+        full_text = "".join(tokens)
         bbox      = draw.textbbox((0, 0), full_text, font=fnt)
         total_w   = bbox[2] - bbox[0]
         x = max(24, (frame_w - total_w) // 2)
         y = (cap_h - (bbox[3] - bbox[1])) // 2
 
-        for i, w in enumerate(phrase_words):
-            word_str = w["word"] + (" " if i < len(phrase_words) - 1 else "")
-            is_cur   = (i == current_idx)
-            color    = (255, 220, 0, 255) if is_cur else (255, 255, 255, 230)
+        for i, tok in enumerate(tokens):
+            is_cur = (i == current_idx)
+            color  = (255, 220, 0, 255) if is_cur else (255, 255, 255, 230)
             if is_cur:
-                draw.text((x + 2, y + 2), word_str, font=fnt, fill=(0, 0, 0, 160))
-            draw.text((x, y), word_str, font=fnt, fill=color)
-            wb = draw.textbbox((0, 0), word_str, font=fnt)
+                draw.text((x + 2, y + 2), tok, font=fnt, fill=(0, 0, 0, 160))
+            draw.text((x, y), tok, font=fnt, fill=color)
+            wb = draw.textbbox((0, 0), tok, font=fnt)
             x += wb[2] - wb[0]
 
         out = Image.new("RGB", (frame_w, cap_h), (0, 0, 0))
         out.paste(img, mask=img.split()[3])
         return np.array(out)
 
-    def _build_caption_clips(self, words_in_clip, final_w, final_h, cap_h=160):
+    def _build_caption_clips(self, words_in_clip, final_w, final_h,
+                             cap_h=160, clip_dur=None):
         """Pre-render one ImageClip per word (no per-frame PIL overhead)."""
-        cap_y  = final_h - cap_h - 50
-        clips  = []
+        cap_y = final_h - cap_h - 50
+        clips = []
 
         for i, word in enumerate(words_in_clip):
-            dur = max(word["end"] - word["start"], 0.04)
-            ph_s = max(0, i - 3)
-            ph_e = min(len(words_in_clip), i + 5)
+            w_start = word["start"]
+            w_end   = word["end"]
+            # Clamp to clip duration so captions never exceed the video length
+            if clip_dur is not None:
+                w_end = min(w_end, clip_dur)
+            dur = max(w_end - w_start, 0.04)
+
+            ph_s    = max(0, i - 3)
+            ph_e    = min(len(words_in_clip), i + 5)
             phrase  = words_in_clip[ph_s:ph_e]
             cur_idx = i - ph_s
 
             frame = self._render_caption_image(phrase, cur_idx, final_w, cap_h)
             clips.append(
                 ImageClip(frame, duration=dur)
-                .with_start(word["start"])
+                .with_start(w_start)
                 .with_position((0, cap_y))
             )
 
@@ -327,86 +355,86 @@ class AgentOpusClipper:
         if output_dir is None:
             output_dir = OUTPUT_DIR
 
-        t_start = highlight["start"]
-        t_end   = highlight["end"]
-        score   = highlight.get("virality_score", 0)
-        title   = re.sub(r"[^\w\s-]", "", highlight.get("title", "clip")).strip()
-        title   = title.replace(" ", "_")[:40]
+        t_start  = highlight["start"]
+        t_end    = highlight["end"]
+        score    = highlight.get("virality_score", 0)
+        title    = re.sub(r"[^\w\s-]", "", highlight.get("title", "clip")).strip()
+        title    = title.replace(" ", "_")[:40]
         out_path = os.path.join(output_dir, f"[{score}]_{title}.mp4")
 
         self._cb(f'Rendering "{title}" ({t_start:.0f}s–{t_end:.0f}s)…', progress_pct)
 
-        video  = VideoFileClip(video_path).subclipped(t_start, t_end)
+        video        = VideoFileClip(video_path).subclipped(t_start, t_end)
         src_w, src_h = video.size
+        clip_dur     = video.duration
 
-        # Crop geometry
-        if aspect == "9:16":
-            tgt_w, tgt_h = int(src_h * 9 / 16), src_h
-        elif aspect == "1:1":
-            side = min(src_w, src_h)
-            tgt_w = tgt_h = side
-        else:
-            tgt_w, tgt_h = src_w, src_h   # 16:9 passthrough
-
-        face_fn = self._compute_face_track(video) if aspect != "16:9" else None
-
-        def crop_frame(get_frame, t):
-            frame = get_frame(t)
-            if aspect == "16:9":
-                return frame
-
-            if face_fn is not None:
-                cx = float(face_fn(t))
-                cx = max(tgt_w / 2, min(src_w - tgt_w / 2, cx))
-            else:
-                cx = src_w / 2
-
-            x0 = int(max(0, min(src_w - tgt_w, cx - tgt_w / 2)))
-
-            if aspect == "9:16":
-                return frame[:, x0:x0 + tgt_w]
-            else:   # 1:1
-                cy = src_h // 2
-                y0 = int(max(0, min(src_h - tgt_h, cy - tgt_h // 2)))
-                return frame[y0:y0 + tgt_h, x0:x0 + tgt_w]
-
-        cropped = video.transform(crop_frame)
-
-        # Output resolution
+        # Output resolution lookup
         final_w, final_h = {"9:16": (1080, 1920),
                             "1:1":  (1080, 1080),
                             "16:9": (1920, 1080)}.get(aspect, (1080, 1920))
-        cropped = cropped.resized((final_w, final_h))
 
-        # Animated captions
+        # ── Build cropped/resized video ────────────────────────────────────
+        if aspect == "16:9":
+            # No crop needed — just resize to target resolution
+            cropped = video.resized((final_w, final_h))
+        else:
+            tgt_w = int(src_h * 9 / 16) if aspect == "9:16" else min(src_w, src_h)
+            tgt_h = src_h               if aspect == "9:16" else tgt_w
+
+            face_fn = self._compute_face_track(video)
+
+            def crop_frame(get_frame, t):
+                frame = get_frame(t)
+                cx    = float(face_fn(t)) if face_fn is not None else src_w / 2
+                cx    = max(tgt_w / 2, min(src_w - tgt_w / 2, cx))
+                x0    = int(max(0, min(src_w - tgt_w, cx - tgt_w / 2)))
+
+                if aspect == "9:16":
+                    return frame[:, x0:x0 + tgt_w]
+                else:  # 1:1
+                    cy = src_h // 2
+                    y0 = int(max(0, min(src_h - tgt_h, cy - tgt_h // 2)))
+                    return frame[y0:y0 + tgt_h, x0:x0 + tgt_w]
+
+            cropped = video.transform(crop_frame).resized((final_w, final_h))
+
+        # ── Animated captions ─────────────────────────────────────────────
         words_in = [
             {**w, "start": w["start"] - t_start, "end": w["end"] - t_start}
-            for w in words if t_start <= w["start"] <= t_end
+            for w in words if t_start <= w["start"] < t_end
         ]
-        cap_clips = self._build_caption_clips(words_in, final_w, final_h)
+        cap_clips = self._build_caption_clips(words_in, final_w, final_h,
+                                              clip_dur=clip_dur)
 
-        final = CompositeVideoClip([cropped] + cap_clips)
-        final = final.with_audio(video.audio)
+        final     = CompositeVideoClip([cropped] + cap_clips)
+        has_audio = video.audio is not None
+        if has_audio:
+            final = final.with_audio(video.audio)
 
-        final.write_videofile(
-            out_path,
-            codec="libx264",
-            audio_codec="aac",
-            fps=30,
-            threads=8,
-            ffmpeg_params=["-crf", "18", "-preset", "fast"],
-            logger=None,
-        )
+        try:
+            final.write_videofile(
+                out_path,
+                codec="libx264",
+                audio_codec="aac" if has_audio else None,
+                fps=30,
+                threads=8,
+                ffmpeg_params=["-crf", "18", "-preset", "fast"],
+                logger=None,
+            )
+        finally:
+            # Always release file handles — critical on Windows
+            for clip in (final, cropped, video):
+                try: clip.close()
+                except Exception: pass
 
-        video.close()
         return out_path
 
     # ── Thumbnail ─────────────────────────────────────────────────────────────
     def generate_thumbnail(self, clip_path: str) -> str:
         thumb = clip_path.replace(".mp4", "_thumb.jpg")
         try:
-            clip  = VideoFileClip(clip_path)
-            t     = clip.duration * 0.08
+            clip = VideoFileClip(clip_path)
+            t    = clip.duration * 0.08
             Image.fromarray(clip.get_frame(t)).save(thumb, quality=85)
             clip.close()
         except Exception:
@@ -435,7 +463,6 @@ class AgentOpusClipper:
             ollama_model=ollama_model,
         )
         if not highlights:
-            # Last resort: return the whole video as one clip
             if segments:
                 total = segments[-1]["end"]
                 highlights = [{
@@ -475,15 +502,19 @@ if __name__ == "__main__":
     p.add_argument("--clips",  type=int, default=6)
     p.add_argument("--aspect", default="9:16", choices=["9:16", "1:1", "16:9"])
     p.add_argument("--model",  default="large-v3")
+    p.add_argument("--llm",    default="llama3",
+                   help="Ollama model name, or 'none' to use heuristic scorer only")
     args = p.parse_args()
 
     def log(msg, pct): print(f"[{pct:3d}%] {msg}")
     clipper = AgentOpusClipper(whisper_model_size=args.model, progress_callback=log)
 
     if args.url:
-        res = clipper.run(args.url,  is_url=True,  max_clips=args.clips, aspect=args.aspect)
+        res = clipper.run(args.url,  is_url=True,  max_clips=args.clips,
+                          aspect=args.aspect, ollama_model=args.llm)
     elif args.file:
-        res = clipper.run(args.file, is_url=False, max_clips=args.clips, aspect=args.aspect)
+        res = clipper.run(args.file, is_url=False, max_clips=args.clips,
+                          aspect=args.aspect, ollama_model=args.llm)
     else:
         p.print_help(); raise SystemExit(1)
 
