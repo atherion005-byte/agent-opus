@@ -1,0 +1,25 @@
+# Core ML
+torch>=2.5.0
+torchvision>=0.20.0
+torchaudio>=2.5.0
+faster-whisper>=1.2.0
+ultralytics>=8.3.0
+
+# Video processing
+moviepy>=2.1.0
+yt-dlp>=2026.1.0
+opencv-python>=4.10.0
+scipy>=1.13.0
+Pillow>=10.4.0
+numpy>=1.26.0
+
+# AI agents (optional — for advanced highlight analysis)
+ollama>=0.4.0
+crewai>=1.0.0
+langchain-ollama>=0.2.0
+
+# Web UI
+gradio>=6.0.0
+
+# Utilities
+tqdm>=4.67.0
